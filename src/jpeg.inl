@@ -59,6 +59,11 @@ int16_t i16_Consts[8] = {0x80, 113, 90, 22, 46, 1,32,2048};
 #define HAS_NEON
 #endif
 
+#if !defined(HAS_SIMD) && !defined(HAS_NEON) && !defined(NO_SIMD) && defined(__ARM_FEATURE_MVE)
+#include <arm_mve.h>
+#define HAS_MVE
+#endif
+
 // forward references
 static int JPEGInit(JPEGIMAGE *pJPEG);
 static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb);
@@ -97,14 +102,35 @@ static const unsigned char cZigZag2[64] = {0,1,8,16,9,2,3,10,
 #ifdef HAS_NEON
 // 16-bit constants for NEON ycc->rgb conversion
 static const int16_t __attribute__((aligned(16))) sYCCRGBConstants[4] = {5742/2, -2925/2, -1409/2, 7258/2};
-// 16-bit constants for IDCT calculation
+#endif // HAS_NEON
+#if defined(HAS_NEON) || defined(HAS_MVE)
+// 16-bit constants for IDCT calculation (shared by NEON and MVE)
 static const int16_t __attribute__((aligned(16))) s0414[8] = {1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2}; // 1.414213562 - 1.0
 static const int16_t __attribute__((aligned(16))) s1414[8] = {5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2}; // 1.414213562
 static const int16_t __attribute__((aligned(16))) s1847[8] = {7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2}; // 1.8477
 static const int16_t __attribute__((aligned(16))) s2613[8] = {-10703,-10703,-10703,-10703,-10703,-10703,-10703,-10703}; // -2.6131259
 static const int16_t __attribute__((aligned(16))) sp2613[8] = {10703,10703,10703,10703,10703,10703,10703,10703}; // 2.6131259
 static const int16_t __attribute__((aligned(16))) s1082[8] = {4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2}; // 1.08239
-#endif // HAS_NEON
+#endif // HAS_NEON || HAS_MVE
+#ifdef HAS_MVE
+// Helium (MVE) helper functions for the ycc->rgb conversion
+// The constants match the NEON sYCCRGBConstants[] values; vqdmulhq doubles them
+// back to the full scale factors { 5742, -2925, -1409, 7258 } / 4096.
+// chroma gather offsets: each Cb/Cr value covers 2 horizontally adjacent pixels (4:2:0)
+static const uint16_t mveChromaOffLo[8] = {0,0,1,1,2,2,3,3};
+static const uint16_t mveChromaOffHi[8] = {4,4,5,5,6,6,7,7};
+// clamp a (pixel<<4) signed vector to 0..255 and return it as u16 lanes
+static inline uint16x8_t mve_sat8(int16x8_t v)
+{
+    return vshrq_n_u16(vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(v, vdupq_n_s16(0)), vdupq_n_s16(255 << 4))), 4);
+}
+// pack three 0..255 channel vectors into 8 RGB565 pixels
+static inline uint16x8_t mve_pack565(uint16x8_t R, uint16x8_t G, uint16x8_t B)
+{
+    return vorrq_u16(vorrq_u16(vshrq_n_u16(B, 3), vshlq_n_u16(vandq_u16(G, vdupq_n_u16(0x00fc)), 3)),
+                     vshlq_n_u16(vandq_u16(R, vdupq_n_u16(0x00f8)), 8));
+}
+#endif // HAS_MVE
 
 #ifdef HAS_SSE
 #if defined ( __GNUC__ ) || defined( _GCC_ANDROID ) || defined( __APPLE__)
@@ -1178,7 +1204,6 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     }
     // now do AC components (up to 4 tables of 16-bit codes)
     // We split the codes into a short table (9 bits or less) and a long table (first 5 bits are 1)
-    if (pJPEG->ucMode == 0xc2) return 1; // don't calculate for progressive mode
     for (iTable = 0; iTable < 4; iTable++)
     {
         if (pJPEG->ucHuffTableUsed & (1 << (iTable+4)))  // if this table is defined
@@ -1442,6 +1467,10 @@ static int JPEGFilter(uint8_t *pBuf, uint8_t *d, int iLen, uint8_t *bFF)
 	uint32x2_t u322merged;
 #endif // OLD_NEON
 #endif // HAS_NEON
+#ifdef HAS_MVE
+	uint8x16_t u816FF = vdupq_n_u8(0xff);
+	uint8x16_t u816In;
+#endif // HAS_MVE
 
     unsigned char c, *s, *pEnd, *pStart;
     
@@ -1515,6 +1544,32 @@ static int JPEGFilter(uint8_t *pBuf, uint8_t *d, int iLen, uint8_t *bFF)
 			} // if need to remove stuffed FF's or markers
 		} // while processing buffer with SIMD
 #endif // HAS_NEON
+#ifdef HAS_MVE
+	while (s < pEnd - 16)
+	{
+		u816In = vld1q_u8(s);
+		if (vcmpeqq_u8(u816In, u816FF) == 0) // no FF's, just copy this block
+		{
+			vst1q_u8(d, u816In);
+			s += 16;
+			d += 16;
+		}
+		else
+		{
+		int i = 16; // do these 16 bytes the slow way
+		while (i) {
+			c = *d++ = *s++;
+			if (c == 0xff) { // marker or stuffed zeros?
+				if (s[0] != 0) { // it's a marker, skip both
+					d--;
+				}
+			s++; // for stuffed 0's, store the FF, skip the 00
+			} // found FF
+			i--;
+		} // while processing the 16 "slow" bytes
+		} // if need to remove stuffed FF's or markers
+	} // while processing buffer with MVE
+#endif // HAS_MVE
 
     while (s < pEnd)
     {
@@ -2290,11 +2345,11 @@ __m128i mmxRow0, mmxRow1, mmxRow2, mmxRow3, mmxRow4, mmxRow5, mmxRow6, mmxRow7;
 __m128i mmxTemp, mmxTemp0, mmxTemp1, mmxTemp2, mmxTemp3, mmxTemp4, mmxTemp5, mmxTemp6, mmxTemp7, mmxTemp10, mmxTemp11, mmxTemp12, mmxTemp13;
 __m128i mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
 #endif // HAS_SSE
-#ifdef HAS_NEON
+#if defined(HAS_NEON) || defined(HAS_MVE)
 int16x8_t mmxRow0, mmxRow1, mmxRow2, mmxRow3, mmxRow4, mmxRow5, mmxRow6, mmxRow7;
 int16x8_t mmxTemp, mmxTemp0, mmxTemp1, mmxTemp2, mmxTemp3, mmxTemp4, mmxTemp5, mmxTemp6, mmxTemp7, mmxTemp10, mmxTemp11, mmxTemp12, mmxTemp13;
 int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
-#endif // HAS_NEON
+#endif // HAS_NEON || HAS_MVE
  
     u16MCUFlags = pJPEG->u16MCUFlags;
         
@@ -2438,7 +2493,7 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
     mmxRow7 = _mm_sub_epi16(mmxTemp0, mmxTemp7); // row 7
     _mm_storeu_si128((__m128i *)&pMCUSrc[56], mmxRow7);
 #endif // HAS_SSE
-#ifdef HAS_NEON
+#if defined(HAS_NEON) || defined(HAS_MVE)
         if ((u16MCUFlags & 0x2000) == 0) // rows 4-7 are not populated, simpler calculations
            {
            // even part
@@ -2547,10 +2602,10 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         vst1q_s16(&pMCUSrc[40], mmxRow5);
         mmxRow6 = vsubq_s16(mmxTemp1, mmxTemp6); // row 6
         vst1q_s16(&pMCUSrc[48], mmxRow6);
-        mmxRow7 = vsubq_s16(mmxTemp0, mmxTemp7); // row 7
-        vst1q_s16(&pMCUSrc[56], mmxRow7);
-#endif // HAS_NEON
-#if !defined (HAS_SSE) && !defined(HAS_NEON)
+         mmxRow7 = vsubq_s16(mmxTemp0, mmxTemp7); // row 7
+         vst1q_s16(&pMCUSrc[56], mmxRow7);
+#endif // HAS_NEON || HAS_MVE
+#if !defined (HAS_SSE) && !defined(HAS_NEON) && !defined(HAS_MVE)
     // do columns first
     u16MCUFlags |= 1; // column 0 must always be calculated
     for (int iCol = 0; iCol < 8 && u16MCUFlags; iCol++)
@@ -2781,6 +2836,34 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
             LR_out = vaddq_s16(LR_out, vdupq_n_s16(0x80 << 5)); // adjust output +0x80
             LR_out_8x8 = vqshrun_n_s16(LR_out, 5); // shift, narrow and clip to 0-255
             vst1_u8(pOutput, LR_out_8x8);
+        }
+#elif defined(HAS_MVE)
+        {
+            // build [tmp0,tmp1,tmp2,tmp3,tmp3,tmp2,tmp1,tmp0] + [tmp7,tmp6,tmp5,-tmp4,tmp4,-tmp5,-tmp6,-tmp7]
+            // = the 8 output pixels in (pixel<<5) scale, then clamp, shift and narrow-store them
+            int16x8_t vEven, vOdd;
+            vEven = vdupq_n_s16((int16_t)tmp0);
+            vEven = vsetq_lane_s16((int16_t)tmp1, vEven, 1);
+            vEven = vsetq_lane_s16((int16_t)tmp2, vEven, 2);
+            vEven = vsetq_lane_s16((int16_t)tmp3, vEven, 3);
+            vEven = vsetq_lane_s16((int16_t)tmp3, vEven, 4);
+            vEven = vsetq_lane_s16((int16_t)tmp2, vEven, 5);
+            vEven = vsetq_lane_s16((int16_t)tmp1, vEven, 6);
+            // lane 7 = tmp0
+            vOdd = vdupq_n_s16((int16_t)-tmp7);
+            vOdd = vsetq_lane_s16((int16_t)tmp7, vOdd, 0);
+            vOdd = vsetq_lane_s16((int16_t)tmp6, vOdd, 1);
+            vOdd = vsetq_lane_s16((int16_t)tmp5, vOdd, 2);
+            vOdd = vsetq_lane_s16((int16_t)-tmp4, vOdd, 3);
+            vOdd = vsetq_lane_s16((int16_t)tmp4, vOdd, 4);
+            vOdd = vsetq_lane_s16((int16_t)-tmp5, vOdd, 5);
+            vOdd = vsetq_lane_s16((int16_t)-tmp6, vOdd, 6);
+            // lane 7 = -tmp7
+            vEven = vaddq_s16(vEven, vOdd);
+            vEven = vaddq_n_s16(vEven, 0x80 << 5); // adjust output +0x80
+            vEven = vmaxq_s16(vEven, vdupq_n_s16(0)); // clamp for unsigned saturation
+            vEven = vminq_s16(vEven, vdupq_n_s16(255 << 5));
+            vstrbq_u16(pOutput, vreinterpretq_u16_s16(vshrq_n_s16(vEven, 5))); // narrowing store of the 8 output pixels
         }
 #else
         pOutput[0] = ucRangeTable[(((tmp0 + tmp7)>>5) & 0x3ff)];
@@ -3766,8 +3849,89 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
     }
 #endif // ESP32S3_SIMD
 
+#ifdef HAS_MVE
+    // Helium (MVE) version - converts the whole 16x16 pixel MCU one row-pair at a time.
+    // MCU pixel layout (bytes): Y0@0, Y1@128, Y2@256, Y3@384, Cb@512, Cr@576
+    // - Y rows 2i/2i+1 (left block = Y0 or Y2, right block = Y1 or Y3) share chroma row i
+    // - chroma is gathered with horizontal duplication (4:2:0); measured faster on M85
+    //   than a vst2q/vld1q round-trip (store-to-load stalls)
+    // - RGB8888 uses the vmovnb/vmovnt + vst2q packing pattern (see Arm-2D __arm_2d_ccca8888_pack_u16)
+    {
+        const uint16x8_t offLo = vld1q_u16(mveChromaOffLo);
+        const uint16x8_t offHi = vld1q_u16(mveChromaOffHi);
+        const uint8_t *pYBase = (const uint8_t *)&pJPEG->sMCUs[0 * DCTSIZE];
+        const uint8_t *pCbBase = (const uint8_t *)&pJPEG->sMCUs[4 * DCTSIZE];
+        const uint8_t *pCrBase = (const uint8_t *)&pJPEG->sMCUs[5 * DCTSIZE];
+        const uint16x8_t vAlpha = vdupq_n_u16(0xff);
+        const uint8x16_t vZero8 = vdupq_n_u8(0);
+        uint16_t *pOut = pOutput;
+        int iStride = iPitch; // output row stride in uint16 units
+        int bBE = (pJPEG->ucPixelType == RGB565_BIG_ENDIAN);
+        if (pJPEG->ucPixelType == RGB8888)
+            iStride = iPitch * 2; // 4 bytes per pixel
+        for (int iRP = 0; iRP < 8; iRP++) { // 8 pairs of rows sharing the same chroma
+            const uint8_t *pY = pYBase + (iRP & 3) * 16 + ((iRP & 4) << 6); // rows 2iRP/2iRP+1 of Y0 (or Y2)
+            const uint8_t *pYR = pY + 128; // same rows of Y1 (or Y3)
+            const uint8_t *pCb = pCbBase + iRP * 8;
+            const uint8_t *pCr = pCrBase + iRP * 8;
+            // gather the chroma with horizontal duplication, center it around 0 (c-128)
+            // and pre-scale it by 256 (vldrbq_s16 sign-extends to c-256, NOT c-128!)
+            int16x8_t crL = vshlq_n_s16(vreinterpretq_s16_u16(vsubq_n_u16(vldrbq_gather_offset_u16(pCr, offLo), 128)), 8);
+            int16x8_t crR = vshlq_n_s16(vreinterpretq_s16_u16(vsubq_n_u16(vldrbq_gather_offset_u16(pCr, offHi), 128)), 8);
+            int16x8_t cbL = vshlq_n_s16(vreinterpretq_s16_u16(vsubq_n_u16(vldrbq_gather_offset_u16(pCb, offLo), 128)), 8);
+            int16x8_t cbR = vshlq_n_s16(vreinterpretq_s16_u16(vsubq_n_u16(vldrbq_gather_offset_u16(pCb, offHi), 128)), 8);
+            // chroma contributions shared by both rows of the pair (vqdmulhq doubles the /2 constants)
+            const int16x8_t cr2RL = vqdmulhq_n_s16(crL, 2871); // Cr * 1.402 (5742/2)
+            const int16x8_t cr2RR = vqdmulhq_n_s16(crR, 2871);
+            const int16x8_t cr2GL = vqdmulhq_n_s16(crL, -1462); // Cr * -0.71414 (-2925/2)
+            const int16x8_t cr2GR = vqdmulhq_n_s16(crR, -1462);
+            const int16x8_t cb2GL = vqdmulhq_n_s16(cbL, -704); // Cb * -0.34414 (-1409/2)
+            const int16x8_t cb2GR = vqdmulhq_n_s16(cbR, -704);
+            const int16x8_t cb2BL = vqdmulhq_n_s16(cbL, 3629); // Cb * 1.772 (7258/2)
+            const int16x8_t cb2BR = vqdmulhq_n_s16(cbR, 3629);
+            for (int iRow = 0; iRow < 2; iRow++) { // the 2 rows sharing this chroma
+                // luminance of the left/right 8-pixel halves, scaled by 16 to match chroma
+                int16x8_t yL = vshlq_n_s16(vreinterpretq_s16_u16(vldrbq_u16(pY + iRow * 8)), 4);
+                int16x8_t yR = vshlq_n_s16(vreinterpretq_s16_u16(vldrbq_u16(pYR + iRow * 8)), 4);
+                int16x8_t RL = vaddq_s16(yL, cr2RL);
+                int16x8_t RR = vaddq_s16(yR, cr2RR);
+                int16x8_t GL = vaddq_n_s16(vaddq_s16(vaddq_s16(yL, cr2GL), cb2GL), 8); // +8 = rounding
+                int16x8_t GR = vaddq_n_s16(vaddq_s16(vaddq_s16(yR, cr2GR), cb2GR), 8);
+                int16x8_t BL = vaddq_n_s16(vaddq_s16(yL, cb2BL), 8);
+                int16x8_t BR = vaddq_n_s16(vaddq_s16(yR, cb2BR), 8);
+                if (pJPEG->ucPixelType == RGB8888) {
+                    uint8x16x2_t vout;
+                    // pixels 0-7: bytes [R,B] even/odd + [G,A] even/odd -> vst2q makes R,G,B,A
+                    // (matches the scalar JPEGPixelRGB order; was B,G,R,A before PR#121 alignment)
+                    vout.val[0] = vmovnbq_u16(vZero8, mve_sat8(RL));
+                    vout.val[0] = vmovntq_u16(vout.val[0], mve_sat8(BL));
+                    vout.val[1] = vmovnbq_u16(vZero8, mve_sat8(GL));
+                    vout.val[1] = vmovntq_u16(vout.val[1], vAlpha);
+                    vst2q_u8((uint8_t *)pOut, vout);
+                    // pixels 8-15
+                    vout.val[0] = vmovnbq_u16(vZero8, mve_sat8(RR));
+                    vout.val[0] = vmovntq_u16(vout.val[0], mve_sat8(BR));
+                    vout.val[1] = vmovnbq_u16(vZero8, mve_sat8(GR));
+                    vout.val[1] = vmovntq_u16(vout.val[1], vAlpha);
+                    vst2q_u8((uint8_t *)pOut + 32, vout);
+                } else { // RGB565
+                    uint16x8_t pxL = mve_pack565(mve_sat8(RL), mve_sat8(GL), mve_sat8(BL));
+                    uint16x8_t pxR = mve_pack565(mve_sat8(RR), mve_sat8(GR), mve_sat8(BR));
+                    if (bBE) { // reverse the bytes
+                        pxL = vreinterpretq_u16_u8(vrev16q_u8(vreinterpretq_u8_u16(pxL)));
+                        pxR = vreinterpretq_u16_u8(vrev16q_u8(vreinterpretq_u8_u16(pxR)));
+                    }
+                    vst1q_u16(pOut, pxL);
+                    vst1q_u16(pOut + 8, pxR);
+                }
+                pOut += iStride;
+            } // for each of the 2 rows
+        } // for each row pair
+        return;
+    }
+#endif // HAS_MVE
+
 #ifdef HAS_NEON
-    if (x+8 <= iPitch && (iPitch & 15) == 0) { // only for non-clipped MCUs
     if (pJPEG->ucPixelType == RGB8888) {
        int8x8_t i88Cr, i88Cb;
        uint8x16_t u816YL, u816YR;
@@ -3807,9 +3971,9 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
           i168Y = vreinterpretq_s16_u16(vshll_n_u8(vget_low_u8(u816YR), 4)); // widen and x16 to put on par with Cr/Cb values (right block)
           u88B = vqrshrun_n_s16(i168B, 4); // shift right, narrow and saturate to 8-bit unsigned
           // ugly hack due to bug in GCC of vst4 intrinsics
-          u884Hack.val[0] = u88B;
+          u884Hack.val[0] = u88R;
           u884Hack.val[1] = u88G;
-          u884Hack.val[2] = u88R;
+          u884Hack.val[2] = u88B;
           u884Hack.val[3] = u88A;
           vst4_u8((uint8_t *)pOutput, u884Hack);
           // top right block
@@ -3826,9 +3990,9 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
           i168Y = vreinterpretq_s16_u16(vshll_n_u8(vget_high_u8(u816YL), 4)); // widen and x16 to put on par with Cr/Cb values (right block)
           u88B = vqrshrun_n_s16(i168B, 4); // shift right, narrow and saturate to 8-bit unsigned
           // ugly hack due to bug in GCC of vst4 intrinsics
-          u884Hack.val[0] = u88B;
+          u884Hack.val[0] = u88R;
           u884Hack.val[1] = u88G;
-          u884Hack.val[2] = u88R;
+          u884Hack.val[2] = u88B;
           u884Hack.val[3] = u88A;
           vst4_u8((uint8_t *)(pOutput+16), u884Hack);
           // bottom left block
@@ -3845,9 +4009,9 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
           i168Y = vreinterpretq_s16_u16(vshll_n_u8(vget_high_u8(u816YR), 4)); // widen and x16 to put on par with Cr/Cb values (bottom right block)
           u88B = vqrshrun_n_s16(i168B, 4); // shift right, narrow and saturate to 8-bit unsigned
           // ugly hack due to bug in GCC of vst4 intrinsics
-          u884Hack.val[0] = u88B;
+          u884Hack.val[0] = u88R;
           u884Hack.val[1] = u88G;
-          u884Hack.val[2] = u88R;
+          u884Hack.val[2] = u88B;
           u884Hack.val[3] = u88A;
           vst4_u8((uint8_t *)(pOutput+iPitch*2), u884Hack);
           // bottom right block
@@ -3863,9 +4027,9 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
           i168B = vaddq_s16(i168Y, i168Temp); // now we have 8 B values
           u88B = vqrshrun_n_s16(i168B, 4); // shift right, narrow and saturate to 8-bit unsigned
           // ugly hack due to bug in GCC of vst4 intrinsics
-          u884Hack.val[0] = u88B;
+          u884Hack.val[0] = u88R;
           u884Hack.val[1] = u88G;
-          u884Hack.val[2] = u88R;
+          u884Hack.val[2] = u88B;
           u884Hack.val[3] = u88A;
           vst4_u8((uint8_t *)(pOutput+iPitch*2+16), u884Hack);
           pCr += 8;
@@ -4000,7 +4164,6 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
           } // for each row
       return;
       } // 16bpp
-      } // not clipped
 #endif // HAS_NEON
 
 #ifdef HAS_SSE
@@ -5132,7 +5295,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             }
 
             iSkipMask = 0; // assume not skipping
-            if (pJPEG->ucMode != 0x52 && (bSkipRow || x*mcuCX < pJPEG->iCropX || x*mcuCX > pJPEG->iCropX+pJPEG->iCropCX)) {
+            if (bSkipRow || x*mcuCX < pJPEG->iCropX || x*mcuCX > pJPEG->iCropX+pJPEG->iCropCX) {
                 iSkipMask = MCU_SKIP;
             }
             pJPEG->ucACTable = cACTable0;

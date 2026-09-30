@@ -13,7 +13,8 @@
 //
 #ifndef __JPEGDEC__
 #define __JPEGDEC__
-#if defined( __MACH__ ) || defined( __LINUX__ ) || defined( __MCUXPRESSO ) || defined( ESP_PLATFORM ) || defined(_WIN64)
+
+#if defined( __MACH__ ) || defined( __LINUX__ ) || defined( __MCUXPRESSO ) || defined( ESP_PLATFORM ) || defined(_WIN64) || defined(__MBED__)
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -24,6 +25,7 @@
 #include <FS.h>
 #endif
 #endif
+
 #ifndef PROGMEM
 #define memcpy_P memcpy
 #define PROGMEM
@@ -34,8 +36,8 @@
 #define __builtin_bswap64 _byteswap_uint64
 #define __builtin_bswap32 _byteswap_ulong
 #endif
-// Cortex-M4/M7 allow unaligned access to SRAM
-#if defined(HAL_ESP32_HAL_H_) || defined(TEENSYDUINO) || defined(ARM_MATH_CM4) || defined(ARM_MATH_CM7) || defined (__x86_64__) || defined(TEENSYDUINO)
+// Cortex-M4/M7/M85(Helium) allow unaligned access to SRAM
+#if defined(HAL_ESP32_HAL_H_) || defined(TEENSYDUINO) || defined(ARM_MATH_CM4) || defined(ARM_MATH_CM7) || defined (__x86_64__) || defined(TEENSYDUINO) || defined(__ARM_FEATURE_MVE)
 #define ALLOWS_UNALIGNED
 #endif
 
@@ -47,7 +49,7 @@
 // JPEG Decoder
 // Written by Larry Bank
 // Copyright (c) 2020 BitBank Software, Inc.
-// 
+//
 // Designed to decode baseline JPEG images (8 or 24-bpp)
 // using less than 22K of RAM
 //
